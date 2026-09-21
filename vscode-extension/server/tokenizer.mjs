@@ -128,6 +128,31 @@ function collectCallSpans(node, spans) {
 	for (const c of node.children) collectCallSpans(c, spans);
 }
 
+// Collect the outermost @function-call nodes under `node`, in source order.
+// Like collectCallSpans, but keeps the nodes themselves so their tokens can be
+// re-collected (used to surface @-calls inside otherwise flat-colored spans).
+function collectCallNodes(node, nodes) {
+	if (typeof node.ctorName === "string" && node.ctorName.startsWith("functionCall")) {
+		nodes.push(node);
+		return;
+	}
+	for (const c of node.children) collectCallNodes(c, nodes);
+}
+
+// Paint [start, end) with `fillType`, except for nested @function calls, which
+// keep their own (purple) function coloring. Used by environments whose body is
+// otherwise a single flat color but still interprets @-calls — headings and a
+// link's display text / URL. Mirrors emitRawBody, but fills the whole range
+// rather than only the gaps a raw grammar leaves untokenized.
+function emitFillWithCalls(t, node, start, end, fillType) {
+	const callNodes = [];
+	collectCallNodes(node, callNodes);
+	const callSpans = callNodes.map(n => ({ start: n.source.startIdx, end: n.source.endIdx }));
+	callSpans.sort((a, b) => a.start - b.start);
+	fillOutsideCalls(t, start, end, fillType, callSpans);
+	for (const n of callNodes) n.collect(t);
+}
+
 // Emit `fillType` over [a, b), skipping any sub-range that lies within a call
 // span (those regions are interpreted, not raw). `callSpans` is sorted by start.
 function fillOutsideCalls(t, a, b, fillType, callSpans) {
@@ -330,7 +355,9 @@ function callNameUndefined(node) {
 // returning undefined falls through to recursing into all children.
 const handlers = {
 	heading(node, t) {
-		emit(t, node.source.startIdx, node.source.endIdx, "heading");
+		// The heading is one flat color, but nested @funcs (which the compiler
+		// still interprets) keep their purple function coloring.
+		emitFillWithCalls(t, node, node.source.startIdx, node.source.endIdx, "heading");
 		return true;
 	},
 
@@ -431,8 +458,9 @@ const handlers = {
 		emit(t, s + closeBracket, s + closeBracket + 2, "operator");
 		emit(t, e - 1, e, "operator");
 		// Display text `[...]` is green (linkText); the URL `(...)` stays string.
-		emit(t, s + 1, s + closeBracket, "linkText");
-		emit(t, s + closeBracket + 2, e - 1, "string");
+		// Both still interpret nested @funcs, which keep their purple coloring.
+		emitFillWithCalls(t, node.children[1], s + 1, s + closeBracket, "linkText");
+		emitFillWithCalls(t, node.children[4], s + closeBracket + 2, e - 1, "string");
 		return true;
 	},
 

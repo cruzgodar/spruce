@@ -141,6 +141,37 @@ test("link URL is highlighted as string", () => {
 	assert.ok(strings.find(t => t.start === 7 && t.end === 26));
 });
 
+test("@function inside a heading keeps its purple coloring", () => {
+	const src = "# Hello @name[x]\n";
+	const tokens = collectTokens(src);
+	const fns = tokens.filter(t => t.type === "spruceFunction");
+	// The @ and the identifier `name` stay purple inside the heading.
+	assert.ok(fns.find(t => t.start === src.indexOf("@") && t.end === src.indexOf("@") + 1));
+	assert.ok(fns.find(t => t.start === src.indexOf("name")));
+	// The surrounding text is still heading-colored, filled around the call.
+	const heading = tokens.filter(t => t.type === "heading");
+	assert.ok(heading.find(t => t.start === 0 && t.end === src.indexOf("@")));
+});
+
+test("@function inside link display text keeps its purple coloring", () => {
+	const src = "[a @name[x] b](url)";
+	const tokens = collectTokens(src);
+	const fns = tokens.filter(t => t.type === "spruceFunction");
+	assert.ok(fns.find(t => t.start === src.indexOf("@") && t.end === src.indexOf("@") + 1));
+	assert.ok(fns.find(t => t.start === src.indexOf("name")));
+	// The display text around the call stays linkText.
+	const linkText = tokens.filter(t => t.type === "linkText");
+	assert.ok(linkText.find(t => t.start === 1 && t.end === src.indexOf("@")));
+});
+
+test("@function inside a link URL keeps its purple coloring", () => {
+	const src = "[text](@name[x])";
+	const tokens = collectTokens(src);
+	const fns = tokens.filter(t => t.type === "spruceFunction");
+	assert.ok(fns.find(t => t.start === src.indexOf("@") && t.end === src.indexOf("@") + 1));
+	assert.ok(fns.find(t => t.start === src.indexOf("name")));
+});
+
 test("escaped @x colors the whole @ + char sequence as escape", () => {
 	const src = "a @] b";
 	const tokens = collectTokens(src);
