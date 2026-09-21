@@ -137,8 +137,10 @@ connection.onCompletion((params) => {
 			label: item.label,
 			kind: COMPLETION_KIND[item.kind] ?? CompletionItemKind.Text,
 			detail: item.detail,
-			// In-scope names sort above the (potentially many) auto-import options.
-			sortText: `${item.autoImport ? "1" : "0"}_${item.label}`,
+			// Locals (a function's parameters) sort above the document's module-scope
+			// and reserved names, which in turn sort above the (potentially many)
+			// auto-import options.
+			sortText: `${item.autoImport ? "2" : item.local ? "0" : "1"}_${item.label}`,
 			// Stash what onCompletionResolve needs to build the import edit. The doc
 			// uri lets it re-read the current text; without an autoImport the field
 			// is absent and resolve is a no-op.

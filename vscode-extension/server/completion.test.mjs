@@ -33,6 +33,82 @@ test("declaration block completions work before the closing fence is typed", () 
 	assert.equal(find(items, "half")?.kind, "function");
 });
 
+// The cursor is written as CURSOR in these fixtures; completions are collected
+// where it sits and filtered down to the parameters in scope there.
+const paramsAt = doc => collectCompletions(doc, doc.indexOf("CURSOR"), {})
+	.filter(i => i.detail === "parameter")
+	.map(i => i.label);
+
+test("declaration block offers the enclosing function's parameters", () => {
+	assert.deepEqual(paramsAt("@@@html\nfunction center(body, width)\n{\n\tCURSOR\n}\n@@@\n"), ["body", "width"]);
+});
+
+test("destructured parameters are offered by their bound names", () => {
+	assert.deepEqual(
+		paramsAt("@@@html\nfunction thm({ name, body: text, level = 1, ...rest }) {\n\tCURSOR\n}\n@@@\n"),
+		["name", "text", "level", "rest"],
+	);
+	assert.deepEqual(
+		paramsAt("@@@html\nfunction f([a, , b = 2, ...tail]) {\n\tCURSOR\n}\n@@@\n"),
+		["a", "b", "tail"],
+	);
+	assert.deepEqual(paramsAt("@@@html\nfunction f({ a: { b, c: d } }) {\n\tCURSOR\n}\n@@@\n"), ["b", "d"]);
+	assert.deepEqual(paramsAt("@@@html\nfunction f({ [k]: v }) {\n\tCURSOR\n}\n@@@\n"), ["v"]);
+	// A default's *value* is not a binding, even when it's a function of its own.
+	assert.deepEqual(paramsAt("@@@html\nfunction f(a = fallback(z)) {\n\tCURSOR\n}\n@@@\n"), ["a"]);
+	assert.deepEqual(paramsAt("@@@html\nfunction f(cb = (zz) => zz, b) {\n\tCURSOR\n}\n@@@\n"), ["cb", "b"]);
+});
+
+test("parameters are found in every function shape a declaration block uses", () => {
+	assert.deepEqual(paramsAt("@@@html\n(function (q) {\n\tCURSOR\n})();\n@@@\n"), ["q"]);
+	assert.deepEqual(paramsAt("@@@html\nconst g = async (m, n) => {\n\tCURSOR\n};\n@@@\n"), ["m", "n"]);
+	assert.deepEqual(paramsAt("@@@html\nfunction* gen(seed) {\n\tCURSOR\n}\n@@@\n"), ["seed"]);
+	assert.deepEqual(paramsAt("@@@html\nclass C { go(step) { CURSOR } }\n@@@\n"), ["step"]);
+});
+
+test("nested functions contribute their parameters too", () => {
+	assert.deepEqual(
+		paramsAt("@@@html\nfunction outer(a) {\n\tconst g = (b, c) => {\n\t\tCURSOR\n\t};\n}\n@@@\n"),
+		["a", "b", "c"],
+	);
+	// A concise arrow body is a scope as well, parenthesized or not.
+	assert.deepEqual(paramsAt("@@@html\nconst f = xs => xs.map(item => item.CURSOR);\n@@@\n"), ["xs", "item"]);
+	assert.deepEqual(paramsAt("@@@html\nconst o = { render(node, depth) { CURSOR } };\n@@@\n"), ["node", "depth"]);
+});
+
+test("a parameter is only offered inside its own function", () => {
+	assert.deepEqual(paramsAt("@@@html\nfunction one(alpha) {}\nfunction two(beta) {\n\tCURSOR\n}\n@@@\n"), ["beta"]);
+	assert.deepEqual(paramsAt("@@@html\nfunction f(p) {}\nCURSOR\n@@@\n"), []);
+	assert.deepEqual(paramsAt("@@@html\nfunction f(p) {}\n@@@\n\nCURSOR prose"), []);
+});
+
+// `if (...) {` and friends look exactly like a call header; only the keyword
+// tells them apart.
+test("a control-flow condition isn't read as a parameter list", () => {
+	assert.deepEqual(paramsAt("@@@html\nfunction f(p) {\n\tif (cond) {\n\t\tCURSOR\n\t}\n}\n@@@\n"), ["p"]);
+	assert.deepEqual(paramsAt("@@@html\nfunction f(p) {\n\tfor (const q of qs) {\n\t\tCURSOR\n\t}\n}\n@@@\n"), ["p"]);
+});
+
+// Brace matching runs over a copy with literals blanked out, so a stray brace or
+// quote in a string, comment, template or regex can't move a function's bounds.
+test("braces inside literals don't derail the scope search", () => {
+	assert.deepEqual(paramsAt('@@@html\nfunction f(p) {\n\tconst s = "} function g(zzz) {";\n\tCURSOR\n}\n@@@\n'), ["p"]);
+	assert.deepEqual(paramsAt("@@@html\nfunction f(p) {\n\t// } function g(zzz) {\n\tCURSOR\n}\n@@@\n"), ["p"]);
+	assert.deepEqual(paramsAt('@@@html\nfunction f(p) {\n\tconst r = /[{"]/g;\n\tCURSOR\n}\n@@@\n'), ["p"]);
+	assert.deepEqual(paramsAt("@@@html\nfunction f(p) {\n\treturn `a } b ${ CURSOR } c`;\n}\n@@@\n"), ["p"]);
+	// A template interpolation is real code, so a function declared in one counts.
+	assert.deepEqual(paramsAt("@@@html\nfunction f(p) {\n\treturn `x ${ [1].map(q => CURSOR) } y`;\n}\n@@@\n"), ["p", "q"]);
+});
+
+test("a parameter shadows the reserved global it shares a name with", () => {
+	const doc = "@@@html\nfunction f(document, body) {\n\tCURSOR\n}\n@@@\n";
+	const items = collectCompletions(doc, doc.indexOf("CURSOR"), {});
+	const documents = items.filter(i => i.label === "document");
+	assert.equal(documents.length, 1, "exactly one `document` entry");
+	assert.equal(documents[0].detail, "parameter", "the parameter wins");
+	assert.ok(documents[0].local, "and is marked local so it sorts first");
+});
+
 test("@-call offers reserved functions and defined names, not value globals", () => {
 	const doc = "@@@\nfunction greet() {}\n@@@\n\nHello @gr";
 	const items = collectCompletions(doc, doc.length, {});

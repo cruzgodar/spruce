@@ -325,6 +325,25 @@ test("call: @[...] is the identity on inline content", async () =>
 	assert.equal(await compile(lib + "@[@up[hi]]", "html"), NL + "HI");
 });
 
+// An inline block's body guards each step with ~"]<hashes>", so a ] that isn't
+// the closer is escaped through to the output instead of failing the block.
+test("call: an inline block body can hold a bare ] or [", async () =>
+{
+	assert.equal(await compile("@#[b]c]#", "html"), "b]c");
+	assert.equal(await compile("@##[a]b]c]##", "html"), "a]b]c");
+	assert.equal(await compile("@[a[b]", "html"), "a[b");
+	// The unhashed form still ends at the first ], so the rest stays prose.
+	assert.equal(await compile("@[a]b]", "html"), "<p>ab]</p>");
+});
+
+test("call: an inline block body still parses markup and nested calls", async () =>
+{
+	const lib = "@@@html\nfunction up(s) { return s.toUpperCase(); }\n@@@\n";
+	assert.equal(await compile(lib + "@up#[a]b]#", "html"), NL + "A]B");
+	assert.equal(await compile("@[see [text](url) here]", "html"), "see <a href=\"url\">text</a> here");
+	assert.equal(await compile(lib + "@#[a @up#[b]c]# d]#", "html"), NL + "a B]C d");
+});
+
 test("call: @[[...]] is the identity on a parsed block", async () =>
 {
 	// Its content is parsed as a whole document, so prose becomes a paragraph.
@@ -564,6 +583,24 @@ test("json: nested @-call interpolates into a JSON string", async () =>
 {
 	const src = `@@@html\nfunction who() { return "Alice"; }\nfunction show(x) { return JSON.stringify(x); }\n@@@\n@show({"who": "@who"})`;
 	assert.equal(await compile(src, "html"), NL + `{"who":"Alice"}`);
+});
+
+// A jsonBlock only refuses a leading *named* call — the shape a desugared prose
+// wrapper takes — so an identity or raw block can open one.
+test("json: a leading @[...] opens a json block rather than prose", async () =>
+{
+	assert.equal(await compile(jsonLib + "@show(@[hi])", "html"), NL + `"hi"`);
+	assert.equal(await compile(jsonLib + "@typeOf(@[hi])", "html"), NL + "string");
+	assert.equal(await compile(jsonLib + "@show(@[[hi]])", "html"), NL + `"<p>hi</p>"`);
+	assert.equal(await compile(jsonLib + "@show(@{42})", "html"), NL + "42");
+});
+
+// The lookahead still has to reject the wrapper a bare call followed by prose
+// desugars to, or the prose would be handed to JSON5.parse.
+test("json: a leading named call is still prose, not a json argument", async () =>
+{
+	assert.equal(await compile(jsonLib + "@show({a: 1}) then *prose*", "html"), NL + `<p>{"a":1} then <em>prose</em></p>`);
+	assert.equal(await compile("@@@html\nfunction id(x) { return x; }\n@@@\n@id[a] tail (@id[b]) end", "html"), NL + "<p>a tail b end</p>");
 });
 
 test("json: @) escapes a literal close paren inside a string", async () =>

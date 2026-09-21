@@ -33,12 +33,21 @@ const HOOK_OVERRIDES_KEY = "__spruceHookOverrides";
 // actually appears (see maxHashDepth) and generate exactly that many alternatives
 // on demand, longest-first so the greedy match wins.
 //
-// jsonBlock (the `(...)` argument form) additionally forbids a leading `@`: prose
-// desugars to wrapped calls like `(@text[...])`, so a bare call followed by prose
-// (`@foo bar` -> `@foo(@text[ bar])`) would otherwise swallow that wrapper as a
-// JSON argument and feed the prose to JSON5.parse. A genuine JSON value never
-// starts with `@`, so the `~"@"` lookahead only rejects those prose wrappers;
-// mid-string interpolation (`{"who": "@who"}`) is unaffected since it starts with `{`.
+// jsonBlock (the `(...)` argument form) additionally forbids a leading wrapped
+// call: prose desugars to wrapped calls like `(@text[...])`, so a bare call
+// followed by prose (`@foo bar` -> `@foo(@text[ bar])`) would otherwise swallow
+// that wrapper as a JSON argument and feed the prose to JSON5.parse. Every such
+// wrapper names a function, so the lookahead rejects `(@name` specifically
+// rather than any `(@` — which leaves `@f(@[...])` and `@f(@{...})` free to open
+// a json block, since those forms never appear as a desugared wrapper.
+// Mid-string interpolation (`{"who": "@who"}`) was never affected either way,
+// since it starts with `{`.
+//
+// An inline block's body guards each iteration with `~"]<hashes>"` rather than
+// leaning on the text rule's blanket `~"]"`: that way a bare ] (or [) inside the
+// body falls through to inline<>'s parsedBlockEscapable and comes out literal,
+// so `#[a]b]#` holds `a]b` and still closes on `]#`. The guard is what stops the
+// escape from eating the closing delimiter.
 function blockRules(maxHashes)
 {
 	const parsed = [];
@@ -50,15 +59,15 @@ function blockRules(maxHashes)
 	{
 		const h = "#".repeat(n);
 		parsed.push(`"${h}[[" (~"]]${h}" any)* "]]${h}"`);
-		inline.push(`"${h}[" inlineWithoutEscapable<~"]${h}" any>+ "]${h}"`);
+		inline.push(`"${h}[" (~"]${h}" inline<~"]${h}" any>)+ "]${h}"`);
 		raw.push(`"${h}{" (functionCall | (~"}${h}" any))+ "}${h}"`);
-		json.push(`"${h}(" ~"@" (functionCall | (~")${h}" any))+ ")${h}"`);
+		json.push(`"${h}(" ~wrappedCallOpener (functionCall | (~")${h}" any))+ ")${h}"`);
 	}
 
 	parsed.push(`"[[" (~"]]" any)* "]]"`);
-	inline.push(`"[" inlineWithoutEscapable<~"]" any>* "]"`);
+	inline.push(`"[" (~"]" inline<~"]" any>)* "]"`);
 	raw.push(`"{" (functionCall | (~"}" any))* "}"`);
-	json.push(`"(" ~"@" (functionCall | (~")" any))* ")"`);
+	json.push(`"(" ~wrappedCallOpener (functionCall | (~")" any))* ")"`);
 
 	const join = alts => alts.join("\n\t| ");
 
@@ -204,8 +213,10 @@ spruce {
   // Start rule for re-matching a parsedInlineBlock body in isolation (see the
   // parsedInlineBlock desugar handler): the whitespace-trimmed body string is
   // re-parsed as inline content so its desugaring matches what the block would
-  // have produced, minus the trimmed leading/trailing whitespace.
-  inlineContent = inlineWithoutEscapable<~end any>*
+  // have produced, minus the trimmed leading/trailing whitespace. inline<>, not
+  // inlineWithoutEscapable<>, because the body may hold a bare [ or ] that the
+  // block's own guard let through (see blockRules).
+  inlineContent = inline<~end any>*
 
 
   // The raw content of code blocks, display math, etc.
@@ -237,6 +248,13 @@ spruce {
     | "@" (~space any)                                                     --escaped
     | "@" space                                                            --invalid
     
+  // The @name head of a wrapped call, exactly as desugaring emits it — flush
+  // against the "(" — which is what a jsonBlock's lookahead rejects so a prose
+  // wrapper can't be read as a JSON argument (see blockRules). Only the *named*
+  // form is excluded: @[...] and @{...} never appear in that position, so they
+  // stay usable as json content.
+  wrappedCallOpener = "@" spaceOrTab* jsIdentifier
+
   jsIdentifier = jsIdentifierStart jsIdentifierPart*
   jsIdentifierStart = letter | "_" | "$"
   jsIdentifierPart = jsIdentifierStart | digit

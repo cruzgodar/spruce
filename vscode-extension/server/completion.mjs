@@ -7,7 +7,8 @@
 //   * Inside a `@@@ ... @@@` declaration block the body is plain JS, so bare
 //     identifiers fall through to globalThis — we offer the reserved globals
 //     (the format stdlib plus filePath/JSON5) alongside anything the document
-//     has already defined or imported.
+//     has already defined or imported, plus the parameters of whichever
+//     function(s) the cursor is nested in (see enclosingParameterNames).
 //   * After an `@` function call we offer the reserved *functions* (the stdlib
 //     renderers) plus the document's defined/imported names, since `@name`
 //     invokes whatever `name` resolves to in module scope.
@@ -109,8 +110,337 @@ function declarationBlocks(text) {
 	return blocks;
 }
 
+// The declaration block whose body contains `offset`, or null.
+function declarationBlockAt(text, offset) {
+	return declarationBlocks(text).find(b => offset >= b.bodyStart && offset <= b.bodyEnd) ?? null;
+}
+
 function inDeclarationBlock(text, offset) {
-	return declarationBlocks(text).some(b => offset >= b.bodyStart && offset <= b.bodyEnd);
+	return declarationBlockAt(text, offset) !== null;
+}
+
+// --- Local scope inside a declaration block ---------------------------------
+//
+// Module-scope names come out of definedNames above, but a cursor inside a
+// function body also sees that function's parameters, and those are the names
+// most worth offering there. Finding them means matching brackets in the block's
+// JS, so everything below works on a copy with literals blanked out (a `{` in a
+// string or a `//` in a URL would otherwise throw the matching off).
+
+// `src` with the contents of comments, strings, template literals and regex
+// literals replaced by spaces — delimiters included, newlines kept, and the same
+// length as `src` so offsets still line up. Template interpolations stay intact:
+// `${...}` holds real code, and a function can be declared in there.
+function blankJsLiterals(src) {
+	const out = src.split("");
+	const blank = (from, to) => {
+		for (let i = from; i < to && i < src.length; i++) {
+			if (src[i] !== "\n" && src[i] !== "\r") out[i] = " ";
+		}
+	};
+
+	// Brace depths at which each open `${` started, innermost last: when a `}`
+	// brings the depth back to one of them, we're back inside its template.
+	const interpolations = [];
+	let depth = 0;
+	let inTemplate = false;
+	// The last code character that wasn't whitespace, which is what tells a regex
+	// literal from a division (`replace(/x/)` vs `a / b`).
+	let previous = "";
+	let i = 0;
+
+	while (i < src.length) {
+		const c = src[i];
+
+		if (inTemplate) {
+			if (c === "\\") { blank(i, i + 2); i += 2; continue; }
+			if (c === "`") { blank(i, i + 1); i += 1; inTemplate = false; previous = "`"; continue; }
+			if (c === "$" && src[i + 1] === "{") {
+				blank(i, i + 2);
+				i += 2;
+				interpolations.push(depth);
+				depth++;
+				inTemplate = false;
+				previous = "{";
+				continue;
+			}
+			blank(i, i + 1);
+			i += 1;
+			continue;
+		}
+
+		if (c === "/" && src[i + 1] === "/") {
+			let end = i + 2;
+			while (end < src.length && src[end] !== "\n" && src[end] !== "\r") end++;
+			blank(i, end);
+			i = end;
+			continue;
+		}
+
+		if (c === "/" && src[i + 1] === "*") {
+			const close = src.indexOf("*/", i + 2);
+			const end = close === -1 ? src.length : close + 2;
+			blank(i, end);
+			i = end;
+			continue;
+		}
+
+		if (c === '"' || c === "'") {
+			let end = i + 1;
+			while (end < src.length && src[end] !== c) {
+				if (src[end] === "\\") end++;
+				end++;
+			}
+			blank(i, Math.min(end + 1, src.length));
+			i = end + 1;
+			previous = c;
+			continue;
+		}
+
+		if (c === "`") {
+			blank(i, i + 1);
+			i += 1;
+			inTemplate = true;
+			continue;
+		}
+
+		if (c === "/" && regexAllowedAfter(previous)) {
+			let end = i + 1;
+			let inClass = false;
+			while (end < src.length && !(src[end] === "/" && !inClass)) {
+				if (src[end] === "\\") end++;
+				else if (src[end] === "[") inClass = true;
+				else if (src[end] === "]") inClass = false;
+				else if (src[end] === "\n") break;
+				end++;
+			}
+			blank(i, Math.min(end + 1, src.length));
+			i = end + 1;
+			previous = "/";
+			continue;
+		}
+
+		if (c === "{") depth++;
+		if (c === "}") {
+			depth--;
+			if (interpolations.length && depth === interpolations[interpolations.length - 1]) {
+				interpolations.pop();
+				inTemplate = true;
+				i += 1;
+				continue;
+			}
+		}
+
+		if (!/\s/.test(c)) previous = c;
+		i += 1;
+	}
+
+	return out.join("");
+}
+
+// Whether a `/` after `previous` opens a regex literal rather than dividing.
+// Only the punctuation cases are covered; a regex right after a keyword
+// (`return /x/`) reads as division here, which at worst blanks a stretch of code
+// and costs a few completions.
+function regexAllowedAfter(previous) {
+	return previous === "" || "(,=:[!&|?{};+-*%~^<>".includes(previous);
+}
+
+const BRACKET_CLOSERS = { "(": ")", "[": "]", "{": "}" };
+
+// For each opening bracket in `code` (already literal-blanked), the index of the
+// one that closes it, or -1. Built in a single pass so the scope search below
+// can look a match up per candidate header instead of rescanning the source.
+function bracketMatches(code) {
+	const matches = new Int32Array(code.length).fill(-1);
+	const open = [];
+	for (let i = 0; i < code.length; i++) {
+		const c = code[i];
+		if (c === "(" || c === "[" || c === "{") open.push(i);
+		else if (c === ")" || c === "]" || c === "}") {
+			const start = open.pop();
+			if (start !== undefined && BRACKET_CLOSERS[code[start]] === c) matches[start] = i;
+		}
+	}
+	return matches;
+}
+
+// Index of the next non-whitespace character at or after `from`, or -1.
+function nextSignificant(code, from) {
+	for (let i = from; i < code.length; i++) {
+		if (!/\s/.test(code[i])) return i;
+	}
+	return -1;
+}
+
+// The identifier ending just before `i`, ignoring spaces and tabs, or "". Read
+// backwards rather than by matching `code.slice(0, i)`, which would copy the
+// whole block once per candidate header.
+function wordBefore(code, i) {
+	let end = i;
+	while (end > 0 && (code[end - 1] === " " || code[end - 1] === "\t")) end--;
+	let start = end;
+	while (start > 0 && /[\w$]/.test(code[start - 1])) start--;
+	return code.slice(start, end);
+}
+
+// Keywords whose `(...)` is a condition or binding, not a parameter list. The
+// remaining `name(...) {` shapes — a function declaration, a method shorthand,
+// a `function (...)` expression — really do take parameters.
+const NON_FUNCTION_HEADS = new Set(["if", "for", "while", "switch", "catch", "with", "do", "else", "return"]);
+
+// Split `source` on top-level `separator`, ignoring any inside brackets.
+function splitTopLevel(source, separator = ",") {
+	const parts = [];
+	let depth = 0;
+	let start = 0;
+	for (let i = 0; i < source.length; i++) {
+		const c = source[i];
+		if (c === "(" || c === "[" || c === "{") depth++;
+		else if (c === ")" || c === "]" || c === "}") depth--;
+		else if (c === separator && depth === 0) {
+			parts.push(source.slice(start, i));
+			start = i + 1;
+		}
+	}
+	parts.push(source.slice(start));
+	return parts;
+}
+
+// Index of the first top-level `:` in `source`, or -1. Used to tell a
+// destructuring key from the binding it renames.
+function topLevelColon(source) {
+	let depth = 0;
+	for (let i = 0; i < source.length; i++) {
+		const c = source[i];
+		if (c === "(" || c === "[" || c === "{") depth++;
+		else if (c === ")" || c === "]" || c === "}") depth--;
+		else if (c === ":" && depth === 0) return i;
+	}
+	return -1;
+}
+
+// `source` with any top-level default value (`= ...`) removed, so only the bound
+// name is left. `=>` and the comparison operators are skipped so an arrow or a
+// comparison inside a default can't be mistaken for the assignment.
+function stripDefault(source) {
+	let depth = 0;
+	for (let i = 0; i < source.length; i++) {
+		const c = source[i];
+		if (c === "(" || c === "[" || c === "{") depth++;
+		else if (c === ")" || c === "]" || c === "}") depth--;
+		else if (c === "=" && depth === 0) {
+			if (source[i + 1] === "=" || source[i + 1] === ">") return source.slice(0, i);
+			if ("=!<>".includes(source[i - 1])) continue;
+			return source.slice(0, i);
+		}
+	}
+	return source;
+}
+
+// Every name a binding pattern introduces, pushed onto `out`: a plain
+// identifier, the aliases and shorthand keys of an object pattern, the elements
+// of an array pattern, and rest elements. Default *values* are dropped, so
+// `{ a = fallback(b) }` binds only `a`.
+function patternNames(source, out) {
+	const pattern = stripDefault(source).trim().replace(/^\.\.\./, "").trim();
+	if (!pattern) return;
+
+	if (pattern.startsWith("{") || pattern.startsWith("[")) {
+		for (const part of splitTopLevel(pattern.slice(1, -1))) {
+			const colon = pattern.startsWith("{") ? topLevelColon(part) : -1;
+			patternNames(colon === -1 ? part : part.slice(colon + 1), out);
+		}
+		return;
+	}
+
+	if (/^[A-Za-z_$][\w$]*$/.test(pattern)) out.push(pattern);
+}
+
+// The parameter names bound by every function in `body` whose own body encloses
+// `offset`, outermost first and deduped. `body` is a declaration block's JS and
+// `offset` is relative to it.
+function enclosingParameterNames(body, offset) {
+	const code = blankJsLiterals(body);
+	const matches = bracketMatches(code);
+	const names = [];
+	const seen = new Set();
+
+	const claim = (paramsStart, paramsEnd, scopeStart, scopeEnd) => {
+		if (offset <= scopeStart || offset > scopeEnd) return;
+		const found = [];
+		for (const part of splitTopLevel(code.slice(paramsStart, paramsEnd))) patternNames(part, found);
+		for (const name of found) {
+			if (seen.has(name)) continue;
+			seen.add(name);
+			names.push(name);
+		}
+	};
+
+	// The scope a function header at `from` opens: a braced body, or the rest of
+	// a concise arrow's expression (to the next top-level , or ; or the close of
+	// whatever encloses it).
+	const scopeAfter = (from) => {
+		const at = nextSignificant(code, from);
+		if (at === -1) return null;
+		if (code[at] === "{") {
+			const end = matches[at];
+			return { start: at, end: end === -1 ? code.length : end };
+		}
+		let depth = 0;
+		for (let i = at; i < code.length; i++) {
+			const c = code[i];
+			if (c === "(" || c === "[" || c === "{") depth++;
+			else if (c === ")" || c === "]" || c === "}") {
+				if (depth === 0) return { start: at - 1, end: i };
+				depth--;
+			} else if ((c === "," || c === ";") && depth === 0) return { start: at - 1, end: i };
+		}
+		return { start: at - 1, end: code.length };
+	};
+
+	for (let i = 0; i < code.length; i++) {
+		if (code[i] !== "(") continue;
+		const close = matches[i];
+		if (close === -1) continue;
+		const after = nextSignificant(code, close + 1);
+		if (after === -1) continue;
+
+		if (code.startsWith("=>", after)) {
+			const scope = scopeAfter(after + 2);
+			if (scope) claim(i + 1, close, scope.start, scope.end);
+			continue;
+		}
+
+		// `head(...) {` — a function only when `head` isn't a control keyword.
+		if (code[after] !== "{") continue;
+		if (NON_FUNCTION_HEADS.has(wordBefore(code, i))) continue;
+		const end = matches[after];
+		claim(i + 1, close, after, end === -1 ? code.length : end);
+	}
+
+	// `param => ...`, the one arrow form with no parentheses to key off. The
+	// leading character keeps this off a `)` or `]` (already handled above) and
+	// off a property access.
+	for (const m of code.matchAll(/(^|[^\w$.)\]])([A-Za-z_$][\w$]*)[ \t]*=>/g)) {
+		const nameStart = m.index + m[1].length;
+		const scope = scopeAfter(m.index + m[0].length);
+		if (scope) claim(nameStart, nameStart + m[2].length, scope.start, scope.end);
+	}
+
+	return names;
+}
+
+// Completion items for the parameters in scope at `offset`, or [] when the
+// cursor isn't inside a declaration block's function.
+function parameterItems(text, offset) {
+	const block = declarationBlockAt(text, offset);
+	if (!block) return [];
+	const body = text.slice(block.bodyStart, block.bodyEnd);
+	// `local` marks these as the innermost binding, which server.mjs sorts above
+	// the module-scope and auto-import entries.
+	return enclosingParameterNames(body, offset - block.bodyStart)
+		.map(name => ({ label: name, kind: "variable", detail: "parameter", local: true }));
 }
 
 // The identifier prefix of a `@name` call ending at `offset`, or null when the
@@ -772,7 +1102,11 @@ export function collectCompletions(text, offset, { filePath = null, roots = [], 
 	const defined = definedNames(text, filePath);
 
 	let items;
+	// Parameters of the function(s) the cursor sits in. Only a declaration block
+	// has them, and they're the innermost binding, so they shadow everything else.
+	let scoped = [];
 	if (inDeclarationBlock(text, offset)) {
+		scoped = parameterItems(text, offset);
 		items = withDefined(reservedGlobalItems(), defined);
 	} else if (callPrefix(text, offset) !== null) {
 		items = withDefined(reservedFunctionItems(), defined);
@@ -780,5 +1114,8 @@ export function collectCompletions(text, offset, { filePath = null, roots = [], 
 		return [];
 	}
 
-	return items.concat(autoImportItems(defined, roots, filePath, excludes));
+	const shadowed = new Set(scoped.map(item => item.label));
+	return scoped.concat(
+		items.concat(autoImportItems(defined, roots, filePath, excludes)).filter(item => !shadowed.has(item.label))
+	);
 }
