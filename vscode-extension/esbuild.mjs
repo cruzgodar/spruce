@@ -44,7 +44,10 @@ const shared = {
 	logLevel: "info",
 };
 
-// The extension host loads the client's main as CommonJS.
+// The extension host loads the client's main as CommonJS. It pulls in
+// server/context.mjs (the caret-context scan behind the dynamic auto-closing
+// pairs), which esbuild converts along the way — that module deliberately
+// imports nothing, so ohm and spruce.js stay out of this bundle.
 await esbuild.build({
 	...shared,
 	entryPoints: [join(root, "client/extension.js")],

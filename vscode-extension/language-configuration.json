@@ -15,6 +15,13 @@
     ["(", ")"]
   ],
   "colorizedBracketPairs": [],
+  // The baseline set, in force until the extension activates. From then on the
+  // client re-registers "autoClosingPairs" (and only that field) on every cursor
+  // move with the set that suits whatever construct the caret is in, so the
+  // markup delimiters below stop auto-closing in raw function arguments,
+  // declaration blocks, code blocks and the like. See client/extension.js and
+  // server/context.mjs. The other fields here, "surroundingPairs" included,
+  // aren't swappable through that API and always come from this file.
   "autoClosingPairs": [
     { "open": "[", "close": "]" },
     { "open": "(", "close": ")" },

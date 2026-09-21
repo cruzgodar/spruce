@@ -523,6 +523,9 @@ function typeOf(x) { return Array.isArray(x) ? "array" : typeof x; }
 function show(x) { return JSON.stringify(x); }
 function addOne(n) { return String(n + 1); }
 function key(obj, k) { return String(obj[k]); }
+function up(s) { return s.toUpperCase(); }
+function quoted(s) { return JSON.stringify(s); }
+function typeOfA(o) { return typeof o.a; }
 @@@
 `;
 
@@ -582,6 +585,57 @@ test("json: JSON5 leniency accepts trailing commas and unquoted keys", async () 
 {
 	assert.equal(await compile(jsonLib + `@show([1, 2,])`, "html"), NL + `[1,2]`);
 	assert.equal(await compile(jsonLib + `@show({a: 1,})`, "html"), NL + `{"a":1}`);
+});
+
+// @[...] / @[[...]] render to text, so inside a json block their output is
+// quoted into a JSON string; anywhere else the quotes would show up verbatim in
+// the document, so they're left off.
+test("json: an @[...] identity block becomes a JSON string", async () =>
+{
+	assert.equal(await compile(jsonLib + `@show({a: @[hi]})`, "html"), NL + `{"a":"hi"}`);
+	assert.equal(await compile(jsonLib + `@show([@[a], @[b]])`, "html"), NL + `["a","b"]`);
+	assert.equal(await compile(jsonLib + `@show({@[k]: 1})`, "html"), NL + `{"k":1}`);
+	assert.equal(await compile(jsonLib + `@typeOfA({a: @[hi]})`, "html"), NL + "string");
+});
+
+test("json: an @[[...]] identity block becomes a JSON string", async () =>
+{
+	assert.equal(await compile(jsonLib + `@show({a: @[[hi]]})`, "html"), NL + `{"a":"<p>hi</p>"}`);
+});
+
+test("json: a rendered identity block is escaped, not pasted, into the JSON", async () =>
+{
+	assert.equal(await compile(jsonLib + `@show({a: @[he said @{"}hi]})`, "html"), NL + `{"a":"he said \\"hi"}`);
+	assert.equal(await compile(jsonLib + `@show({a: @[[one\n\ntwo]]})`, "html"), NL + `{"a":"<p>one</p>\\n\\n<p>two</p>"}`);
+});
+
+test("json: an identity block inside a JSON string isn't re-quoted", async () =>
+{
+	assert.equal(await compile(jsonLib + `@show({a: "x@[hi]y"})`, "html"), NL + `{"a":"xhiy"}`);
+	assert.equal(await compile(jsonLib + `@show({a: '@[hi]'})`, "html"), NL + `{"a":"hi"}`);
+	assert.equal(await compile(jsonLib + String.raw`@show({a: "x\"@[hi]"})`, "html"), NL + `{"a":"x\\"hi"}`);
+});
+
+// A quote inside a nested call's own argument belongs to that call, not to the
+// JSON text, so it must not flip the scan's in-a-string state.
+test("json: a quote inside a nested call's argument doesn't shift the scan", async () =>
+{
+	assert.equal(await compile(jsonLib + `@show({a: @quoted[q@{"}], b: @[hi]})`, "html"), NL + `{"a":"q\\"","b":"hi"}`);
+});
+
+// Only a json body's *immediate* identity child is quoted: one nested inside
+// another call's parsed-block argument is ordinary string interpolation.
+test("json: an identity nested in a call argument isn't quoted", async () =>
+{
+	assert.equal(await compile(jsonLib + `@show({a: "@up[@[hi]]"})`, "html"), NL + `{"a":"HI"}`);
+});
+
+test("identity: output is never quoted outside a json block", async () =>
+{
+	assert.equal(await compile(jsonLib + `@up[@[hi]]`, "html"), NL + "HI");
+	assert.equal(await compile(jsonLib + `@up{@[hi]}`, "html"), NL + "HI");
+	assert.equal(await compile("x @[hi] y", "html"), "<p>x hi y</p>");
+	assert.equal(await compile("@{a @[b] c}", "html"), "a b c");
 });
 
 

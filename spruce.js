@@ -726,6 +726,14 @@ let nextGetCodeId = 0;
 // id so each call recovers its true startIdx in the desugared document and stays
 // unique. Reset by getCode(); pushed/popped around each re-match in parsedBlock.
 let getCodeOffset = 0;
+// Set by the jsonBlock handler immediately before it compiles a direct
+// @[...] / @[[...]] child that sits outside any JSON5 string literal, and read
+// (and cleared) by identityBlockCode. An identity block renders to text, so on
+// its own it would drop bare words into the JSON5 source; quoting it there makes
+// it the string it already is. The flag is cleared the moment it's consumed, so
+// it can never reach an identity nested deeper inside that call's own arguments
+// (`(a: @f[@[x]])`) — only a json body's immediate child is ever quoted.
+let quoteNextIdentity = false;
 let locationsByStartIdx = {};
 let nextGetCodeDeclarationId = 0;
 let declarationBlockRanges = [];
@@ -754,22 +762,42 @@ function compileArgument(block)
 		: "`" + inner + "`";
 }
 
+// True for an @[...] / @[[...]] identity call — the two forms whose output is
+// always text. `node` is a `functionCall` node; its lone child names the
+// alternative that matched.
+function isIdentityCall(node)
+{
+	const alternative = node.child(0).ctorName;
+	return alternative === "functionCall_inline" || alternative === "functionCall_parsed";
+}
+
 // Shared by the @[[...]] / @[...] identity calls (functionCall_parsed/_inline).
 // `node` is the functionCall node, `block` its parsed/inline block. Stores the
 // block's rendered content (a template literal, so nested ${...} call results
 // flow through) under the call's startIdx and returns the ${storage[id]}
 // placeholder, exactly like a wrapped/bare call but with no function applied —
 // the identity. block.getCode() also emits the inner calls' assignments.
+//
+// Inside a jsonBlock the stored value is additionally JSON.stringify'd (see
+// quoteNextIdentity), so `@f({a: @[hi]})` hands JSON5.parse `{a: "hi"}` rather
+// than the bare word `hi`.
 function identityBlockCode(node, block)
 {
 	const startIdx = node.source.startIdx + getCodeOffset;
 	const id = JSON.stringify(startIdx);
+	// Read-and-clear before descending: the block's own body is parsed content,
+	// not JSON, so a nested identity in there must not inherit the quoting.
+	const quote = quoteNextIdentity;
+	quoteNextIdentity = false;
 	// Resolve block.getCode() into a local *before* the `codeToExecute +=`: it
 	// appends the inner calls' assignments as a side effect, and a compound
 	// assignment reads codeToExecute's old value before evaluating the RHS, so
 	// inlining the call would discard those inner assignments.
 	const inner = block.getCode();
-	codeToExecute += `${storageName}[${id}] = \`${inner}\`;\n`;
+	const value = "`" + inner + "`";
+	// JSON.stringify, not bare quotes: the rendered text may hold quotes, newlines
+	// or backslashes, and all of those have to survive JSON5.parse.
+	codeToExecute += `${storageName}[${id}] = ${quote ? `JSON.stringify(${value})` : value};\n`;
 	return "${" + storageName + "[" + id + "]}";
 }
 
@@ -924,9 +952,42 @@ const getCodeOperation = {
 
 	// Same template-literal body as a raw block; compileArgument wraps it in
 	// JSON5.parse(`...`) so the text is parsed into a real value at runtime.
+	//
+	// The body is emitted child by child rather than by the default join so we can
+	// track whether each one sits inside a JSON5 string literal. An @[...] /
+	// @[[...]] identity block renders to text, so outside a string it has to be
+	// quoted to be valid JSON (`{a: @[hi]}` -> `{a: "hi"}`); inside one the
+	// surrounding quotes already do that (`{a: "x@[hi]y"}`), and adding more would
+	// break the parse. Walking children instead of scanning the raw text keeps a
+	// quote inside a nested call's own argument from flipping the state, matching
+	// how the extension's JSON highlighter treats each call as one opaque span.
 	jsonBlock(_1, body, _2)
 	{
-		return body.getCode();
+		let code = "";
+		let quote = null;
+		let escaped = false;
+
+		for (const child of body.children)
+		{
+			if (child.ctorName === "functionCall")
+			{
+				quoteNextIdentity = quote === null && isIdentityCall(child);
+				code += child.getCode();
+				quoteNextIdentity = false;
+				continue;
+			}
+
+			code += child.getCode();
+
+			const character = child.sourceString;
+
+			if (escaped) escaped = false;
+			else if (quote === null) quote = character === '"' || character === "'" ? character : null;
+			else if (character === "\\") escaped = true;
+			else if (character === quote) quote = null;
+		}
+
+		return code;
 	},
 
 
