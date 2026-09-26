@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import { realpathSync, unlinkSync } from "fs";
 import { readFile, unlink, writeFile } from "fs/promises";
 import JSON5 from "json5";
+import { register } from "module";
 import * as ohm from "ohm-js";
 import { dirname, extname, join, resolve as resolvePath } from "path";
 import process from "process";
@@ -1197,8 +1198,8 @@ function logSourceError(ex, body, source, functionCallLocations, declarationBloc
 {
 	const stack = ex.stack || `${ex}`;
 	// The stack frame for the generated fragment reads
-	// `.__fragments_<uuid>.mjs:LINE:COL`; pull out the line number.
-	const fragmentMatch = stack.match(/\.__fragments_[^:?]+\.mjs:(\d+):\d+/);
+	// `.__fragments_<uuid>.mjs?spruceCompile=<id>:LINE:COL`; pull out the line number.
+	const fragmentMatch = stack.match(/\.__fragments_[^:?]+\.mjs(?:\?[^:]*)?:(\d+):\d+/);
 
 	if (!fragmentMatch) return false;
 
@@ -1311,7 +1312,7 @@ ${captureOverrides}`;
 		throw new Error(`Couldn't write the compiled output to ${baseDir}${filePath ? ` (the directory of filePath "${filePath}")` : ""}: ${ex.message}`);
 	}
 
-	const moduleUrl = pathToFileURL(path);
+	const moduleUrl = withCompileId(pathToFileURL(path));
 
 	try
 	{
@@ -1334,6 +1335,46 @@ ${captureOverrides}`;
 	{
 		await removeFragment(path);
 	}
+}
+
+// Node caches ES modules by URL, so a file imported by two documents (or twice
+// by the same one) would otherwise be evaluated once and share its module-level
+// state — a counter it initializes would keep counting across compile() calls.
+// Each compile instead imports its fragment and standard library with a unique
+// `?spruceCompile=<id>` query, and this resolve hook copies that query from a
+// parent onto every local file it imports, transitively, so each compile gets
+// fresh instances of the user's own modules. Packages under node_modules and
+// builtins are left alone and stay cached. Inlined as a data: URL (rather than a
+// sibling file) so it survives the VS Code extension bundling spruce.js.
+const COMPILE_ID_PARAM = "spruceCompile";
+const compileIdHooks = `
+export async function resolve(specifier, context, nextResolve)
+{
+	const result = await nextResolve(specifier, context);
+	if (!context.parentURL?.startsWith("file:") || !result.url.startsWith("file:")) return result;
+	const id = new URL(context.parentURL).searchParams.get(${JSON.stringify(COMPILE_ID_PARAM)});
+	if (id === null) return result;
+	const url = new URL(result.url);
+	if (url.pathname.includes("/node_modules/")) return result;
+	url.searchParams.set(${JSON.stringify(COMPILE_ID_PARAM)}, id);
+	return { ...result, url: url.href };
+}`;
+
+let compileIdHooksRegistered = false;
+let currentCompileId = "";
+
+// Tag a file URL with the current compile's id so it (and the local files it
+// imports) get module instances private to this compile.
+function withCompileId(url)
+{
+	if (!compileIdHooksRegistered)
+	{
+		register(`data:text/javascript,${encodeURIComponent(compileIdHooks)}`);
+		compileIdHooksRegistered = true;
+	}
+
+	url.searchParams.set(COMPILE_ID_PARAM, currentCompileId);
+	return url;
 }
 
 // Delete a fragment and stop tracking it — but only once it is provably gone.
@@ -1401,6 +1442,9 @@ async function _compileImpl(input, outputFormat, { raw = false, preserveWhitespa
 	// keeps them raw. Set before any desugaring so the block handlers see it.
 	preserveWhitespace = preserveWs;
 
+	// Fresh module instances for this compile's imports (see withCompileId).
+	currentCompileId = randomUUID();
+
 	// Snapshot the keys we're about to splat so we can restore on the way out.
 	// Users still override behavior by declaring/importing the name in their
 	// document — that shadows globalThis during the generated module's
@@ -1452,7 +1496,7 @@ async function _compileImpl(input, outputFormat, { raw = false, preserveWhitespa
 			let standardLibraryModule;
 			try
 			{
-				standardLibraryModule = await import(pathToFileURL(resolvePath(standardLibrary)).href);
+				standardLibraryModule = await import(withCompileId(pathToFileURL(resolvePath(standardLibrary))).href);
 			}
 			catch (ex)
 			{

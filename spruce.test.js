@@ -206,6 +206,29 @@ test("standard library: a document hook beats the stdlib default but loses to a 
 	);
 });
 
+test("standard library: module state resets between compiles", async (t) =>
+{
+	const { path, cleanup } = writeStandardLibrary(`let n = 1; export function f() { return n++; }`);
+	t.after(cleanup);
+	assert.equal(await compile("@f @f", "html", { standardLibrary: path }), "<p>1 2</p>");
+	assert.equal(await compile("@f @f", "html", { standardLibrary: path }), "<p>1 2</p>");
+});
+
+test("declaration-block imports: module state resets between compiles but is shared within one", async (t) =>
+{
+	const counter = writeStandardLibrary(`let n = 1; export function next() { return n++; }`);
+	t.after(counter.cleanup);
+
+	// Re-exporting through a second file checks that the reset reaches transitive
+	// imports, and that both paths still see the same instance within a compile.
+	const wrapper = writeStandardLibrary(`export { next } from ${JSON.stringify(counter.path)};`);
+	t.after(wrapper.cleanup);
+
+	const doc = `@@@html\nimport { next } from ${JSON.stringify(counter.path)};\nimport { next as viaWrapper } from ${JSON.stringify(wrapper.path)};\n@@@\n@next @viaWrapper`;
+	assert.equal(await compile(doc, "html"), "\n<p>1 2</p>");
+	assert.equal(await compile(doc, "html"), "\n<p>1 2</p>");
+});
+
 test("standard library: a missing file raises a clear error", async () =>
 {
 	await assert.rejects(
